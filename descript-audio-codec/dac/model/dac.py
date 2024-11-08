@@ -1,87 +1,152 @@
+import math
+from typing import List, Union
+import numpy as np
 import torch
 from torch import nn
-import math
 from audiotools import AudioSignal
 from audiotools.ml import BaseModel
-from dac.nn.quantize import ResidualVectorQuantize
+from .base import CodecMixin
 from dac.nn.layers import Snake1d, WNConv1d, WNConvTranspose1d
+from dac.nn.quantize import ResidualVectorQuantize
 
-class DAC(BaseModel):
+def init_weights(m):
+    if isinstance(m, nn.Conv1d):
+        nn.init.trunc_normal_(m.weight, std=0.02)
+        nn.init.constant_(m.bias, 0)
+
+class ResidualUnit(nn.Module):
+    def __init__(self, dim: int = 16, dilation: int = 1):
+        super().__init__()
+        pad = ((7 - 1) * dilation) // 2
+        self.block = nn.Sequential(
+            Snake1d(dim),
+            WNConv1d(dim, dim, kernel_size=7, dilation=dilation, padding=pad),
+            Snake1d(dim),
+            WNConv1d(dim, dim, kernel_size=1),
+        )
+
+    def forward(self, x):
+        y = self.block(x)
+        pad = (x.shape[-1] - y.shape[-1]) // 2
+        if pad > 0:
+            x = x[..., pad:-pad]
+        return x + y
+
+class EncoderBlock(nn.Module):
+    def __init__(self, dim: int = 16, stride: int = 1):
+        super().__init__()
+        self.block = nn.Sequential(
+            ResidualUnit(dim // 2, dilation=1),
+            ResidualUnit(dim // 2, dilation=3),
+            ResidualUnit(dim // 2, dilation=9),
+            Snake1d(dim // 2),
+            WNConv1d(
+                dim // 2, dim, kernel_size=2 * stride, stride=stride, padding=math.ceil(stride / 2),
+            ),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+class Encoder(nn.Module):
+    def __init__(
+        self, d_model: int = 64, strides: list = [2, 4, 8, 8], d_latent: int = 64,
+    ):
+        super().__init__()
+        self.block = [WNConv1d(1, d_model, kernel_size=7, padding=3)]
+        for stride in strides:
+            d_model *= 2
+            self.block += [EncoderBlock(d_model, stride=stride)]
+        self.block += [
+            Snake1d(d_model),
+            WNConv1d(d_model, d_latent, kernel_size=3, padding=1),
+        ]
+        self.block = nn.Sequential(*self.block)
+        self.enc_dim = d_model
+
+    def forward(self, x):
+        return self.block(x)
+
+class DecoderBlock(nn.Module):
+    def __init__(self, input_dim: int = 16, output_dim: int = 8, stride: int = 1):
+        super().__init__()
+        self.block = nn.Sequential(
+            Snake1d(input_dim),
+            WNConvTranspose1d(
+                input_dim, output_dim, kernel_size=2 * stride, stride=stride, padding=math.ceil(stride / 2),
+            ),
+            ResidualUnit(output_dim, dilation=1),
+            ResidualUnit(output_dim, dilation=3),
+            ResidualUnit(output_dim, dilation=9),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+class Decoder(nn.Module):
+    def __init__(
+        self, input_channel, channels, rates, d_out: int = 1,
+    ):
+        super().__init__()
+        layers = [WNConv1d(input_channel, channels, kernel_size=7, padding=3)]
+        for i, stride in enumerate(rates):
+            input_dim = channels // 2**i
+            output_dim = channels // 2 ** (i + 1)
+            layers += [DecoderBlock(input_dim, output_dim, stride)]
+        layers += [
+            Snake1d(output_dim),
+            WNConv1d(output_dim, d_out, kernel_size=7, padding=3),
+            nn.Tanh(),
+        ]
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.model(x)
+
+class DAC(BaseModel, CodecMixin):
     def __init__(
         self,
         encoder_dim: int = 64,
-        encoder_rates: list = [2, 4, 8, 8],
+        encoder_rates: List[int] = [2, 4, 8, 8],
         latent_dim: int = None,
         decoder_dim: int = 1536,
-        decoder_rates: list = [8, 8, 4, 2],
+        decoder_rates: List[int] = [8, 8, 4, 2],
         n_codebooks: int = 9,
         codebook_size: int = 1024,
-        codebook_dim: int = 8,
+        codebook_dim: Union[int, list] = 8,
+        quantizer_dropout: bool = False,
         sample_rate: int = 44100,
     ):
         super().__init__()
+        self.encoder_dim = encoder_dim
+        self.encoder_rates = encoder_rates
+        self.decoder_dim = decoder_dim
+        self.decoder_rates = decoder_rates
         self.sample_rate = sample_rate
-        self.hop_length = math.prod(encoder_rates)
 
         if latent_dim is None:
             latent_dim = encoder_dim * (2 ** len(encoder_rates))
+        self.latent_dim = latent_dim
+        self.hop_length = np.prod(encoder_rates)
 
-        self.encoder = self._create_encoder(encoder_dim, encoder_rates, latent_dim)
+        self.encoder = Encoder(encoder_dim, encoder_rates, latent_dim)
+        self.n_codebooks = n_codebooks
+        self.codebook_size = codebook_size
+        self.codebook_dim = codebook_dim
         self.quantizer = ResidualVectorQuantize(
             input_dim=latent_dim,
             n_codebooks=n_codebooks,
             codebook_size=codebook_size,
             codebook_dim=codebook_dim,
+            quantizer_dropout=quantizer_dropout,
         )
-        self.decoder = self._create_decoder(latent_dim, decoder_dim, decoder_rates)
-
-    def _create_encoder(self, dim, rates, latent_dim):
-        layers = [WNConv1d(1, dim, kernel_size=7, padding=3)]
-        for rate in rates:
-            dim *= 2
-            layers.append(self._encoder_block(dim, rate))
-        layers.extend([
-            Snake1d(dim),
-            WNConv1d(dim, latent_dim, kernel_size=3, padding=1),
-        ])
-        return nn.Sequential(*layers)
-
-    def _encoder_block(self, dim, stride):
-        return nn.Sequential(
-            self._residual_unit(dim // 2),
-            self._residual_unit(dim // 2),
-            self._residual_unit(dim // 2),
-            Snake1d(dim // 2),
-            WNConv1d(dim // 2, dim, kernel_size=2*stride, stride=stride, padding=stride//2),
+        self.decoder = Decoder(
+            latent_dim, decoder_dim, decoder_rates,
         )
+        self.sample_rate = sample_rate
+        self.apply(init_weights)
+        self.delay = self.get_delay()
 
-    def _residual_unit(self, dim):
-        return nn.Sequential(
-            Snake1d(dim),
-            WNConv1d(dim, dim, kernel_size=7, padding=3),
-            Snake1d(dim),
-            WNConv1d(dim, dim, kernel_size=1),
-        )
-
-    def _create_decoder(self, input_dim, dim, rates):
-        layers = [WNConv1d(input_dim, dim, kernel_size=7, padding=3)]
-        for i, rate in enumerate(rates):
-            layers.append(self._decoder_block(dim // (2**i), dim // (2**(i+1)), rate))
-        layers.extend([
-            Snake1d(dim // (2**len(rates))),
-            WNConv1d(dim // (2**len(rates)), 1, kernel_size=7, padding=3),
-            nn.Tanh(),
-        ])
-        return nn.Sequential(*layers)
-
-    def _decoder_block(self, input_dim, output_dim, stride):
-        return nn.Sequential(
-            Snake1d(input_dim),
-            WNConvTranspose1d(input_dim, output_dim, kernel_size=2*stride, stride=stride, padding=stride//2),
-            self._residual_unit(output_dim),
-            self._residual_unit(output_dim),
-            self._residual_unit(output_dim),
-        )
 
     def preprocess(self, audio_data, sample_rate):
         if sample_rate is None:
