@@ -179,11 +179,23 @@ class DAC(BaseModel, CodecMixin):
             "vq/codebook_loss": codebook_loss,
         }
 
-    def compress(self, audio: AudioSignal, **kwargs):
+    def compress(self, audio: AudioSignal, win_duration: float = 5.0, verbose: bool = False, **kwargs):
         audio_data = audio.audio_data
         sample_rate = audio.sample_rate
-        result = self.forward(audio_data, sample_rate, **kwargs)
-        return result["codes"]
+        
+        # Process the audio in windows if necessary
+        if win_duration:
+            window_length = int(win_duration * sample_rate)
+            audio_chunks = audio_data.split(window_length, dim=-1)
+        else:
+            audio_chunks = [audio_data]
+        
+        compressed_chunks = []
+        for chunk in audio_chunks:
+            result = self.forward(chunk, sample_rate, **kwargs)
+            compressed_chunks.append(result["codes"])
+        
+        compressed_data = torch.cat(compressed_chunks, dim=-1)
 
     def decompress(self, compressed_data, **kwargs):
         z = self.quantizer.decode(compressed_data)
