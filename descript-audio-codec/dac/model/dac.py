@@ -197,7 +197,11 @@ class DAC(BaseModel, CodecMixin):
         
         compressed_data = torch.cat(compressed_chunks, dim=-1)
 
-    def decompress(self, compressed_data, **kwargs):
+    def decompress(self, compressed_data, verbose: bool = False, **kwargs):
         z = self.quantizer.decode(compressed_data)
         audio = self.decode(z)
+        
+        if verbose:
+            print(f"Decompressed audio shape: {audio.shape}")
+        
         return AudioSignal(audio, sample_rate=self.sample_rate)
