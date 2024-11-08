@@ -1,13 +1,19 @@
 import math
-from typing import List, Union
+from typing import List
+from typing import Union
+
 import numpy as np
 import torch
-from torch import nn
 from audiotools import AudioSignal
 from audiotools.ml import BaseModel
+from torch import nn
+
 from .base import CodecMixin
-from dac.nn.layers import Snake1d, WNConv1d, WNConvTranspose1d
+from dac.nn.layers import Snake1d
+from dac.nn.layers import WNConv1d
+from dac.nn.layers import WNConvTranspose1d
 from dac.nn.quantize import ResidualVectorQuantize
+from torch.nn.utils.parametrizations import weight_norm
 
 def init_weights(m):
     if isinstance(m, nn.Conv1d):
@@ -179,7 +185,7 @@ class DAC(BaseModel, CodecMixin):
             "vq/codebook_loss": codebook_loss,
         }
 
-    def compress(self, audio: AudioSignal, win_duration: float = 5.0, verbose: bool = False, **kwargs):
+    def compress(self, audio: AudioSignal, win_duration: float = 1.0, verbose: bool = False, normalize_db: float = -16, n_quantizers: int = None, **kwargs):
         audio_data = audio.audio_data
         sample_rate = audio.sample_rate
         
@@ -192,10 +198,25 @@ class DAC(BaseModel, CodecMixin):
         
         compressed_chunks = []
         for chunk in audio_chunks:
-            result = self.forward(chunk, sample_rate, **kwargs)
+            result = self.forward(chunk, sample_rate, n_quantizers=n_quantizers)
             compressed_chunks.append(result["codes"])
         
         compressed_data = torch.cat(compressed_chunks, dim=-1)
+        
+        if verbose:
+            print(f"Compressed audio shape: {compressed_data.shape}")
+        
+        # Create and return a DACFile object
+        return DACFile(
+            codes=compressed_data,
+            chunk_length=window_length,
+            original_length=audio.signal_length,
+            input_db=audio.loudness(),
+            channels=audio.num_channels,
+            sample_rate=sample_rate,
+            padding=self.padding,
+            dac_version=SUPPORTED_VERSIONS[-1]
+        )
 
     def decompress(self, compressed_data, verbose: bool = False, **kwargs):
         z = self.quantizer.decode(compressed_data)
