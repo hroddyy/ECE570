@@ -14,6 +14,7 @@ from dac.nn.layers import WNConv1d
 from dac.nn.layers import WNConvTranspose1d
 from dac.nn.quantize import ResidualVectorQuantize
 from torch.nn.utils.parametrizations import weight_norm
+import tqdm
 
 def init_weights(m):
     if isinstance(m, nn.Conv1d):
@@ -185,38 +186,76 @@ class DAC(BaseModel, CodecMixin):
             "vq/codebook_loss": codebook_loss,
         }
 
-    def compress(self, audio: AudioSignal, win_duration: float = 1.0, verbose: bool = False, normalize_db: float = -16, n_quantizers: int = None, **kwargs):
-        audio_data = audio.audio_data
-        sample_rate = audio.sample_rate
+    @torch.no_grad()
+    def compress(
+        self,
+        audio_path_or_signal: Union[str, Path, AudioSignal],
+        win_duration: float = 1.0,
+        verbose: bool = False,
+        normalize_db: float = -16,
+        n_quantizers: int = None,
+    ) -> DACFile:
+        audio_signal = audio_path_or_signal if isinstance(audio_signal, AudioSignal) else AudioSignal.load_from_file_with_ffmpeg(str(audio_path_or_signal))
         
-        # Process the audio in windows if necessary
-        if win_duration:
-            window_length = int(win_duration * sample_rate)
-            audio_chunks = audio_data.split(window_length, dim=-1)
+        self.eval()
+        original_padding = self.padding
+        original_device = audio_signal.device
+        audio_signal = audio_signal.clone()
+        original_sr = audio_signal.sample_rate
+        original_length = audio_signal.signal_length
+
+        # Resample and normalize
+        audio_signal.resample(self.sample_rate)
+        input_db = audio_signal.loudness()
+        if normalize_db is not None:
+            audio_signal.normalize(normalize_db)
+        audio_signal.ensure_max_of_audio()
+
+        nb, nac, nt = audio_signal.audio_data.shape
+        audio_signal.audio_data = audio_signal.audio_data.reshape(nb * nac, 1, nt)
+
+        # Determine processing strategy (chunked or unchunked)
+        if audio_signal.signal_duration <= win_duration:
+            self.padding = True
+            n_samples = nt
+            hop = nt
         else:
-            audio_chunks = [audio_data]
-        
-        compressed_chunks = []
-        for chunk in audio_chunks:
-            result = self.forward(chunk, sample_rate, n_quantizers=n_quantizers)
-            compressed_chunks.append(result["codes"])
-        
-        compressed_data = torch.cat(compressed_chunks, dim=-1)
-        
-        if verbose:
-            print(f"Compressed audio shape: {compressed_data.shape}")
-        
-        # Create and return a DACFile object
-        return DACFile(
-            codes=compressed_data,
-            chunk_length=window_length,
-            original_length=audio.signal_length,
-            input_db=audio.loudness(),
-            channels=audio.num_channels,
-            sample_rate=sample_rate,
+            self.padding = False
+            audio_signal.zero_pad(self.delay, self.delay)
+            n_samples = int(win_duration * self.sample_rate)
+            n_samples = int(math.ceil(n_samples / self.hop_length) * self.hop_length)
+            hop = self.get_output_length(n_samples)
+
+        # Process audio in chunks
+        codes = []
+        range_fn = tqdm.trange if verbose else range
+        for i in range_fn(0, nt, hop):
+            x = audio_signal[..., i : i + n_samples]
+            x = x.zero_pad(0, max(0, n_samples - x.shape[-1]))
+            audio_data = x.audio_data.to(self.device)
+            audio_data = self.preprocess(audio_data, self.sample_rate)
+            _, c, _, _, _ = self.encode(audio_data, n_quantizers)
+            codes.append(c.to(original_device))
+
+        chunk_length = c.shape[-1]
+        codes = torch.cat(codes, dim=-1)
+
+        dac_file = DACFile(
+            codes=codes,
+            chunk_length=chunk_length,
+            original_length=original_length,
+            input_db=input_db,
+            channels=nac,
+            sample_rate=original_sr,
             padding=self.padding,
-            dac_version=SUPPORTED_VERSIONS[-1]
+            dac_version=SUPPORTED_VERSIONS[-1],
         )
+
+        if n_quantizers is not None:
+            codes = codes[:, :n_quantizers, :]
+
+        self.padding = original_padding
+        return dac_file
 
     def decompress(self, compressed_data, verbose: bool = False, **kwargs):
         z = self.quantizer.decode(compressed_data)
