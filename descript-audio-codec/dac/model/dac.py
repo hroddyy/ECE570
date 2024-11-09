@@ -67,9 +67,12 @@ class DAC(nn.Module):
         return decoded
     
     @classmethod
-    def load(cls, path: str):
-        """Load the model state from a checkpoint."""
-        checkpoint = torch.load(path)
+    def load(cls, path: str, map_to_cpu: bool = True):
+        """Load the model state from a checkpoint with option to map to CPU."""
+        if map_to_cpu:
+            checkpoint = torch.load(path, map_location=torch.device('cpu'), weights_only=True)
+        else:
+            checkpoint = torch.load(path, weights_only=True)
         model = cls()  # Initialize the model
         model.load_state_dict(checkpoint["model_state_dict"])  # Load state_dict
         return model
@@ -81,7 +84,8 @@ def load_model(load_path: str):
 
 # Example usage
 if __name__ == "__main__":
-    model = DAC().to("cpu")
+    load_path = "path/to/checkpoint.pth"  # Replace with the actual path to your checkpoint
+    model = load_model(load_path).to("cpu")  # Load the model from a checkpoint
     x = torch.randn(1, 1, 44100)  # Example input tensor
     output = model(x)
     print("Input shape:", x.shape)
