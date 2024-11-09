@@ -100,7 +100,7 @@ class DAC(BaseModel, CodecMixin):  # Inherit from BaseModel and CodecMixin
     def load(cls, load_path: str):
         """Load the DAC model from a checkpoint file."""
         model = cls()  
-        model.load_state_dict(torch.load(load_path))  
+        model.load_state_dict(torch.load(load_path, weights_only=True))  
         model.eval()  
         return model
 
