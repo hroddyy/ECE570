@@ -3,6 +3,8 @@ from typing import List, Union
 import torch
 import torch.nn as nn
 import numpy as np
+from audiotools.ml import BaseModel  # Import BaseModel
+from .base import CodecMixin  # Import CodecMixin
 
 def init_weights(m):
     if isinstance(m, nn.Conv1d):
@@ -71,17 +73,36 @@ class Decoder(nn.Module):
     def forward(self, x):
         return self.model(x)
 
-class DAC(nn.Module):
+class DAC(BaseModel, CodecMixin):  # Inherit from BaseModel and CodecMixin
     def __init__(self,
                  encoder_dim: int = 64,
                  encoder_rates: List[int] = [2, 4],
+                 latent_dim: int = None,
                  decoder_dim: int = 64,
                  sample_rate: int = 44100):
-        super().__init__()
-        self.encoder = Encoder(encoder_dim, encoder_rates)
-        self.decoder = Decoder(decoder_dim)
+        
+        super().__init__()  # Call the parent class constructor
+        self.encoder_dim = encoder_dim
+        self.encoder_rates = encoder_rates
+        self.decoder_dim = decoder_dim
         self.sample_rate = sample_rate
-        self.apply(init_weights)
+        
+        if latent_dim is None:
+            latent_dim = encoder_dim * (2 ** len(encoder_rates))
+        
+        self.latent_dim = latent_dim
+        
+        # Initialize encoder and decoder components
+        self.encoder = Encoder(encoder_dim)
+        self.decoder = Decoder(decoder_dim)
+
+    @classmethod
+    def load(cls, load_path: str):
+        """Load the DAC model from a checkpoint file."""
+        model = cls()  
+        model.load_state_dict(torch.load(load_path))  
+        model.eval()  
+        return model
 
     def encode(self, audio_data: torch.Tensor):
         return self.encoder(audio_data)
@@ -92,27 +113,27 @@ class DAC(nn.Module):
     def forward(self,
                 audio_data: torch.Tensor,
                 sample_rate: int = None):
+
+        length = audio_data.shape[-1]
         
-        if sample_rate is None:
-            sample_rate = self.sample_rate
+        audio_data = nn.functional.pad(audio_data, (0, length % self.sample_rate))  # Example padding
         
         z = self.encode(audio_data)
+        
         audio_output = self.decode(z)
         
         return {
             "audio": audio_output,
             "z": z,
-            "length": audio_data.shape[-1]
+            "length": length
         }
 
 if __name__ == "__main__":
     model = DAC().to("cpu")
     
-    # Example input
-    length = 44100 * 2  # e.g., for two seconds of audio
+    length = 44100 * 2 
     x = torch.randn(1, 1, length).to(model.device)
     
-    # Forward pass
     out = model(x)["audio"]
     
     print("Input shape:", x.shape)
