@@ -65,6 +65,19 @@ class DAC(nn.Module):
         encoded = self.encoder(x)
         decoded = self.decoder(encoded)
         return decoded
+    
+    @classmethod
+    def load(cls, path: str):
+        """Load the model state from a checkpoint."""
+        checkpoint = torch.load(path)
+        model = cls()  # Initialize the model
+        model.load_state_dict(checkpoint["model_state_dict"])  # Load state_dict
+        return model
+
+def load_model(load_path: str):
+    """Load a DAC model from the specified checkpoint path."""
+    generator = DAC.load(load_path)
+    return generator
 
 # Example usage
 if __name__ == "__main__":
