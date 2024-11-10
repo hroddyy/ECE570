@@ -1,0 +1,16 @@
+train:
+  folders:
+    my_dataset: ["/content/drive/MyDrive/ECE570/code/ARCA23K/ARCA23K.train"]
+  batch_size: 12
+  num_workers: 4
+
+val:
+  folders:
+    my_dataset: ["/content/drive/MyDrive/ECE570/code/ARCA23K/ARCA23K.val"]
+  batch_size: 12
+  num_workers: 4
+
+num_iters: 100000
+save_iters: [10000, 50000, 100000]
+sample_freq: 10000
+valid_freq: 1000
