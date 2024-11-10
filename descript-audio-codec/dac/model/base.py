@@ -27,6 +27,24 @@ class DACFile:
 
     def save(self, path):
         artifacts = {
+            "codes": self.codes.cpu().numpy().astype(np.uint16),  # Move to CPU
+            "metadata": {
+                "input_db": self.input_db.cpu().numpy().astype(np.float32),  # Move to CPU
+                "original_length": self.original_length,
+                "sample_rate": self.sample_rate,
+                "chunk_length": self.chunk_length,
+                "channels": self.channels,
+                "padding": self.padding,
+                "dac_version": SUPPORTED_VERSIONS[-1],
+            },
+        }
+        path = Path(path).with_suffix(".dac")
+        with open(path, "wb") as f:
+            np.save(f, artifacts)  
+        return path
+    '''
+    def save(self, path):
+        artifacts = {
             "codes": self.codes.numpy().astype(np.uint16),
             "metadata": {
                 "input_db": self.input_db.numpy().astype(np.float32),
@@ -42,6 +60,7 @@ class DACFile:
         with open(path, "wb") as f:
             np.save(f, artifacts)
         return path
+    '''
 
     @classmethod
     def load(cls, path):
